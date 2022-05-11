@@ -564,6 +564,7 @@ typedef enum trunk_compaction_type {
 // arguments to a compact_bundle job
 struct trunk_compact_bundle_req {
    trunk_handle         *spl;
+   uint64                addr;
    char                  start_key[MAX_KEY_SIZE];
    char                  end_key[MAX_KEY_SIZE];
    uint16                height;
@@ -2754,9 +2755,6 @@ trunk_garbage_collect_bundle(trunk_handle             *spl,
          if (trunk_bundle_live_for_pivot(spl, node, bundle_no, pivot_no)) {
             const char *start_key = trunk_get_pivot(spl, node, pivot_no);
             const char *end_key   = trunk_get_pivot(spl, node, pivot_no + 1);
-            platform_default_log("zapping old branch %lu in node %lu\n",
-                                 branch->root_addr,
-                                 node->disk_addr);
             trunk_zap_branch_range(
                spl, branch, start_key, end_key, PAGE_TYPE_BRANCH);
          }
@@ -4291,6 +4289,7 @@ trunk_flush_into_bundle(trunk_handle             *spl,    // IN
       spl, &stream, "----------------------------------------\n");
 
    req->spl                  = spl;
+   req->addr                 = child->disk_addr;
    req->height               = trunk_height(spl, child);
    req->bundle_no            = trunk_get_new_bundle(spl, child);
    req->max_pivot_generation = trunk_pivot_generation(spl, child);
@@ -4887,18 +4886,10 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
    __attribute__((unused)) threadid tid;
 
    /*
-    * This prevents an attempt to acquire the node prior to the copy-on-write
-    * root switch.
-    */
-   trunk_modification_lock(spl);
-   trunk_modification_unlock(spl);
-
-   /*
     * 1. Acquire node read lock
     */
-   page_handle *node;
-   rc = trunk_compact_bundle_node_get(spl, req, &node);
-   platform_assert_status_ok(rc);
+   page_handle *node = trunk_node_get(spl, req->addr);
+   platform_assert(node != NULL);
 
    // timers for stats if enabled
    uint64 compaction_start, pack_start;
@@ -5202,14 +5193,16 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
          trunk_key_copy(spl, req->start_key, trunk_max_key(spl, node));
       }
       spl->root_addr = new_root_addr;
-      trunk_node_unlock(spl, node);
       trunk_modification_unlock(spl);
-      trunk_node_unclaim(spl, node);
-      trunk_node_unget(spl, &node);
 
       // garbage collect the old path and bundle
       rc = trunk_garbage_collect_bundle(spl, old_root_addr, req);
       platform_assert_status_ok(rc);
+
+      // only release locks on node after the garbage collection is complete
+      trunk_node_unlock(spl, node);
+      trunk_node_unclaim(spl, node);
+      trunk_node_unget(spl, &node);
 
       if (should_continue) {
          rc = trunk_compact_bundle_node_get(spl, req, &node);
@@ -5810,6 +5803,7 @@ trunk_split_leaf(trunk_handle *spl,
           */
          trunk_compact_bundle_req *req = TYPED_ZALLOC(spl->heap_id, req);
          req->spl                      = spl;
+         req->addr                     = new_leaf->disk_addr;
          req->type                     = comp_type;
          req->bundle_no                = bundle_no;
          req->max_pivot_generation     = trunk_pivot_generation(spl, leaf);
@@ -5846,6 +5840,7 @@ trunk_split_leaf(trunk_handle *spl,
    // set next_addr of leaf (from last iteration)
    trunk_compact_bundle_req *req = TYPED_ZALLOC(spl->heap_id, req);
    req->spl                      = spl;
+   req->addr                     = leaf->disk_addr;
    // req->height already 0
    req->bundle_no                    = bundle_no;
    req->max_pivot_generation         = trunk_pivot_generation(spl, leaf);
@@ -6303,6 +6298,7 @@ trunk_compact_leaf(trunk_handle *spl, page_handle *leaf)
    // Issue compact_bundle for leaf and release
    trunk_compact_bundle_req *req = TYPED_ZALLOC(spl->heap_id, req);
    req->spl                      = spl;
+   req->addr                     = leaf->disk_addr;
    // req->height already 0
    req->bundle_no                    = bundle_no;
    req->max_pivot_generation         = trunk_pivot_generation(spl, leaf);
