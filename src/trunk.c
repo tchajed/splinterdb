@@ -3182,7 +3182,6 @@ trunk_node_get_maybe_descend(trunk_handle             *spl,
 {
    trunk_node_get(spl->cc, req->addr, node);
    while (trunk_height(node) != req->height) {
-      trunk_node_get(spl->cc, req->addr, node);
       debug_assert(trunk_height(node) > req->height);
       debug_assert(req->height != 0);
       trunk_pivot_data *pdata = trunk_get_pivot_data(spl, node, 0);
@@ -3199,6 +3198,8 @@ trunk_node_get_maybe_descend(trunk_handle             *spl,
                                   req->bundle_no);
       trunk_log_node_if_enabled(&stream, spl, node);
       trunk_node_unget(spl->cc, node);
+      // Load the node at new req->addr into node
+      trunk_node_get(spl->cc, req->addr, node);
    }
 }
 
