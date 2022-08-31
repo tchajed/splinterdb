@@ -1007,6 +1007,8 @@ trunk_node_copy(trunk_handle *spl, page_handle *node)
 {
    page_handle *copied_node = trunk_node_alloc(spl, trunk_height(spl, node));
    memmove(copied_node->data, node->data, trunk_page_size(&spl->cfg));
+   trunk_default_log_if_enabled(
+      spl, "Node copy %lu -> %lu\n", node->disk_addr, copied_node->disk_addr);
    return copied_node;
 }
 
@@ -2817,9 +2819,6 @@ trunk_replace_bundle_branches(trunk_handle             *spl,
          if (!trunk_bundle_live_for_pivot(spl, node, bundle_no, pivot_no)) {
             const char *start_key = trunk_get_pivot(spl, node, pivot_no);
             const char *end_key   = trunk_get_pivot(spl, node, pivot_no + 1);
-            platform_default_log("zapping new branch %lu in node %lu\n",
-                                 new_branch->root_addr,
-                                 node->disk_addr);
             trunk_zap_branch_range(
                spl, new_branch, start_key, end_key, PAGE_TYPE_BRANCH);
          }
@@ -4929,17 +4928,18 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
          /*
           * 3. Abort if node is a splitting leaf (interaction 6)
           */
-         trunk_node_unget(spl, &node);
          trunk_default_log_if_enabled(
             spl,
-            "compact_bundle abort leaf split: range %s-%s, height %u, bundle "
+            "compact_bundle abort leaf split: addr %lu, range %s-%s, height %u, bundle "
             "%u\n",
+            node->disk_addr,
             key_string(trunk_data_config(spl),
                        slice_create(trunk_key_size(spl), req->start_key)),
             key_string(trunk_data_config(spl),
                        slice_create(trunk_key_size(spl), req->end_key)),
             req->height,
             req->bundle_no);
+         trunk_node_unget(spl, &node);
          platform_free(spl->heap_id, req);
          if (spl->cfg.use_stats) {
             spl->stats[tid].compactions_aborted_leaf_split[height]++;
@@ -5178,10 +5178,6 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
       if (!should_continue && num_replacements != 0 && pack_req.num_tuples != 0)
       {
          const char *max_key = trunk_max_key(spl, node);
-         platform_default_log(
-            "zapping extra ref in new branch %lu in node %lu\n",
-            new_branch.root_addr,
-            node->disk_addr);
          trunk_zap_branch_range(
             spl, &new_branch, max_key, NULL, PAGE_TYPE_BRANCH);
       }
@@ -5803,7 +5799,7 @@ trunk_split_leaf(trunk_handle *spl,
           */
          trunk_compact_bundle_req *req = TYPED_ZALLOC(spl->heap_id, req);
          req->spl                      = spl;
-         req->addr                     = new_leaf->disk_addr;
+         req->addr                     = leaf->disk_addr;
          req->type                     = comp_type;
          req->bundle_no                = bundle_no;
          req->max_pivot_generation     = trunk_pivot_generation(spl, leaf);
@@ -5815,7 +5811,8 @@ trunk_split_leaf(trunk_handle *spl,
 
          trunk_default_log_if_enabled(
             spl,
-            "compact_bundle enqueue: range %s-%s, height %u, bundle %u\n",
+            "compact_bundle enqueue: addr %lu, range %s-%s, height %u, bundle %u\n",
+            req->addr,
             key_string(trunk_data_config(spl),
                        slice_create(trunk_key_size(spl), req->start_key)),
             key_string(trunk_data_config(spl),
