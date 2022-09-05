@@ -696,7 +696,7 @@ void                               trunk_compact_bundle            (void *arg, v
 platform_status                    trunk_flush                     (trunk_handle *spl, page_handle *parent, trunk_pivot_data *pdata, bool is_space_rec);
 platform_status                    trunk_flush_fullest             (trunk_handle *spl, page_handle *node);
 static inline bool                 trunk_needs_split               (trunk_handle *spl, page_handle *node);
-int                                trunk_split_index               (trunk_handle *spl, page_handle *parent, page_handle *child, uint64 pivot_no);
+int                                trunk_split_index               (trunk_handle *spl, page_handle *parent, page_handle *child, uint64 pivot_no, trunk_compact_bundle_req *req);
 void                               trunk_split_leaf                (trunk_handle *spl, page_handle *parent, page_handle *leaf, uint16 child_idx);
 int                                trunk_split_root                (trunk_handle *spl, page_handle     *root);
 void                               trunk_print                     (platform_log_handle *log_handle, trunk_handle *spl);
@@ -1065,7 +1065,11 @@ trunk_node_get_by_key_and_height(trunk_handle *spl,      // IN
                                  page_handle **out_node) // OUT
 {
    page_handle *node        = trunk_node_get(spl, spl->root_addr);
-   uint16       root_height = trunk_height(spl, node);
+   while (node->disk_addr != spl->root_addr) {
+      trunk_node_unget(spl, &node);
+      node = trunk_node_get(spl, spl->root_addr);
+   }
+   uint16 root_height = trunk_height(spl, node);
    if (height > root_height) {
       goto error;
    }
@@ -2728,12 +2732,12 @@ trunk_garbage_collect_bundle(trunk_handle             *spl,
       trunk_pivot_data *pdata = trunk_get_pivot_data(spl, node, pivot_no);
       page_handle      *child = trunk_node_get(spl, pdata->addr);
       // Here is where we would deallocate the trunk node
+      trunk_node_claim(spl, &child);
+      trunk_node_lock(spl, child);
       trunk_node_unlock(spl, node);
       trunk_node_unclaim(spl, node);
       trunk_node_unget(spl, &node);
       node = child;
-      trunk_node_claim(spl, &node);
-      trunk_node_lock(spl, node);
    }
 
    debug_assert(trunk_height(spl, node) == height);
@@ -2747,6 +2751,17 @@ trunk_garbage_collect_bundle(trunk_handle             *spl,
    trunk_bundle *bundle       = trunk_get_bundle(spl, node, bundle_no);
    uint16 bundle_start_branch = trunk_bundle_start_branch(spl, node, bundle);
    uint16 bundle_end_branch   = trunk_bundle_end_branch(spl, node, bundle);
+
+   trunk_default_log_if_enabled(
+      spl,
+      "compact_bundle gc: addr %lu, range %s-%s, height %u, bundle %u\n",
+      node->disk_addr,
+      key_string(trunk_data_config(spl),
+                 slice_create(trunk_key_size(spl), req->start_key)),
+      key_string(trunk_data_config(spl),
+                 slice_create(trunk_key_size(spl), req->end_key)),
+      req->height,
+      req->bundle_no);
 
    uint16 num_children = trunk_num_children(spl, node);
    for (uint16 branch_no = bundle_start_branch; branch_no != bundle_end_branch;
@@ -2936,7 +2951,7 @@ trunk_replace_bundle_branches(trunk_handle             *spl,
          uint64 kv_bytes_reclaimed = req->input_pivot_kv_byte_count[pos]
                                      - req->output_pivot_kv_byte_count[pos];
          req->kv_bytes_reclaimed += kv_bytes_reclaimed;
-         pdata->num_kv_bytes_bundle -= req->kv_bytes_reclaimed;
+         pdata->num_kv_bytes_bundle -= kv_bytes_reclaimed;
       }
    }
 
@@ -3233,10 +3248,9 @@ trunk_memtable_iterator_deinit(trunk_handle   *spl,
 platform_status
 trunk_memtable_insert(trunk_handle *spl, char *key, message msg)
 {
-   page_handle    *lock_page;
    uint64          generation;
-   platform_status rc = memtable_maybe_rotate_and_get_insert_lock(
-      spl->mt_ctxt, &generation, &lock_page);
+   platform_status rc =
+      memtable_maybe_rotate_and_readlock_insert_lock(spl->mt_ctxt, &generation);
    if (!SUCCESS(rc)) {
       goto out;
    }
@@ -3259,7 +3273,7 @@ trunk_memtable_insert(trunk_handle *spl, char *key, message msg)
    }
 
 unlock_insert_lock:
-   memtable_unget_insert_lock(spl->mt_ctxt, lock_page);
+   memtable_unreadlock_insert_lock(spl->mt_ctxt);
 out:
    return rc;
 }
@@ -3561,8 +3575,7 @@ trunk_memtable_incorporate_and_flush(trunk_handle  *spl,
     *    memtable generation (Blocks lookups from accessing the memtable that's
     *    being incorporated) and release lookup lock.
     */
-   page_handle *mt_lookup_lock_page =
-      memtable_uncontended_get_claim_lock_lookup_lock(spl->mt_ctxt);
+   memtable_writelock_lookup_lock(spl->mt_ctxt);
    memtable *mt = trunk_get_memtable(spl, generation);
    // Normally need to hold incorp_mutex, but debug code and also guaranteed no
    // one is changing gen_to_incorp (we are the only thread that would try)
@@ -3573,7 +3586,7 @@ trunk_memtable_incorporate_and_flush(trunk_handle  *spl,
       mt, MEMTABLE_STATE_INCORPORATING, MEMTABLE_STATE_INCORPORATED);
    memtable_increment_to_generation_retired(spl->mt_ctxt, generation);
    spl->root_addr = new_root->disk_addr;
-   memtable_unlock_unclaim_unget_lookup_lock(spl->mt_ctxt, mt_lookup_lock_page);
+   memtable_unwritelock_lookup_lock(spl->mt_ctxt);
 
    /*
     * 6. Unlock the TML and new root.
@@ -4495,7 +4508,7 @@ trunk_flush(trunk_handle     *spl,
          return STATUS_OK;
       } else {
          uint64 child_idx = trunk_pdata_to_pivot_index(spl, parent, pdata);
-         trunk_split_index(spl, parent, new_child, child_idx);
+         trunk_split_index(spl, parent, new_child, child_idx, req);
       }
    }
 
@@ -4521,6 +4534,7 @@ trunk_flush(trunk_handle     *spl,
                  slice_create(trunk_key_size(spl), req->end_key)),
       req->height,
       req->bundle_no);
+   platform_assert(trunk_key_compare(spl, req->start_key, req->end_key) < 0);
    rc =
       task_enqueue(spl->ts, TASK_TYPE_NORMAL, trunk_compact_bundle, req, FALSE);
    platform_assert_status_ok(rc);
@@ -4899,56 +4913,7 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
       spl->stats[tid].compactions[height]++;
    }
 
-   /*
-    * 2. If the node has split before this call (interaction 4), this
-    *    bundle was copied to the new sibling[s], so issue compact_bundles for
-    *    those nodes
-    */
-   if (trunk_compact_bundle_node_has_split(spl, req, node)) {
-      if (height != 0) {
-         trunk_compact_bundle_req *next_req =
-            TYPED_MALLOC(spl->heap_id, next_req);
-         memmove(next_req, req, sizeof(trunk_compact_bundle_req));
-         trunk_key_copy(spl, next_req->start_key, trunk_max_key(spl, node));
-         trunk_key_copy(spl, req->end_key, trunk_max_key(spl, node));
-
-         trunk_default_log_if_enabled(
-            spl,
-            "compact_bundle split to: range %s-%s, height %u, bundle %u\n",
-            key_string(trunk_data_config(spl),
-                       slice_create(trunk_key_size(spl), req->start_key)),
-            key_string(trunk_data_config(spl),
-                       slice_create(trunk_key_size(spl), req->end_key)),
-            next_req->height,
-            next_req->bundle_no);
-         rc = task_enqueue(
-            spl->ts, TASK_TYPE_NORMAL, trunk_compact_bundle, next_req, FALSE);
-         platform_assert_status_ok(rc);
-      } else {
-         /*
-          * 3. Abort if node is a splitting leaf (interaction 6)
-          */
-         trunk_default_log_if_enabled(
-            spl,
-            "compact_bundle abort leaf split: addr %lu, range %s-%s, height %u, bundle "
-            "%u\n",
-            node->disk_addr,
-            key_string(trunk_data_config(spl),
-                       slice_create(trunk_key_size(spl), req->start_key)),
-            key_string(trunk_data_config(spl),
-                       slice_create(trunk_key_size(spl), req->end_key)),
-            req->height,
-            req->bundle_no);
-         trunk_node_unget(spl, &node);
-         platform_free(spl->heap_id, req);
-         if (spl->cfg.use_stats) {
-            spl->stats[tid].compactions_aborted_leaf_split[height]++;
-            spl->stats[tid].compaction_time_wasted_ns[height] +=
-               platform_timestamp_elapsed(compaction_start);
-         }
-         return;
-      }
-   }
+   platform_assert(!trunk_compact_bundle_node_has_split(spl, req, node));
 
    /*
     * 4. The bundle may have been completely flushed by 2., if so abort
@@ -5312,13 +5277,12 @@ trunk_flush_node(trunk_handle *spl, uint64 addr, void *arg)
 void
 trunk_force_flush(trunk_handle *spl)
 {
-   page_handle    *lock_page;
    uint64          generation;
-   platform_status rc = memtable_maybe_rotate_and_get_insert_lock(
-      spl->mt_ctxt, &generation, &lock_page);
+   platform_status rc =
+      memtable_maybe_rotate_and_readlock_insert_lock(spl->mt_ctxt, &generation);
    platform_assert_status_ok(rc);
    task_perform_all(spl->ts);
-   memtable_unget_insert_lock(spl->mt_ctxt, lock_page);
+   memtable_unreadlock_insert_lock(spl->mt_ctxt);
    task_perform_all(spl->ts);
    trunk_for_each_node(spl, trunk_flush_node, NULL);
 }
@@ -5348,7 +5312,8 @@ int
 trunk_split_index(trunk_handle *spl,
                   page_handle  *parent,
                   page_handle  *child,
-                  uint64        pivot_no)
+                  uint64        pivot_no,
+                  trunk_compact_bundle_req *req)
 {
    platform_stream_handle stream;
    platform_status        rc = trunk_open_log_stream_if_enabled(spl, &stream);
@@ -5428,6 +5393,33 @@ trunk_split_index(trunk_handle *spl,
    trunk_log_node_if_enabled(&stream, spl, left_node);
    trunk_log_node_if_enabled(&stream, spl, right_node);
    trunk_close_log_stream_if_enabled(spl, &stream);
+
+   if (req != NULL) {
+      trunk_compact_bundle_req *next_req =
+         TYPED_MALLOC(spl->heap_id, next_req);
+      memmove(next_req, req, sizeof(trunk_compact_bundle_req));
+      next_req->addr = right_node->disk_addr;
+      trunk_key_copy(spl, next_req->start_key, trunk_min_key(spl, right_node));
+      platform_assert(trunk_key_compare(spl, next_req->end_key, trunk_max_key(spl, right_node)) == 0);
+
+      platform_assert(trunk_key_compare(spl, req->start_key, trunk_min_key(spl, left_node)) == 0);
+      trunk_key_copy(spl, req->end_key, trunk_max_key(spl,left_node));
+
+      trunk_default_log_if_enabled(
+         spl,
+         "compact_bundle split to: addr %lu, range %s-%s, height %u, bundle %u\n",
+         next_req->addr,
+         key_string(trunk_data_config(spl),
+                    slice_create(trunk_key_size(spl), req->start_key)),
+         key_string(trunk_data_config(spl),
+                    slice_create(trunk_key_size(spl), req->end_key)),
+         next_req->height,
+         next_req->bundle_no);
+      platform_assert(trunk_key_compare(spl, req->start_key, req->end_key) < 0);
+      rc = task_enqueue(
+         spl->ts, TASK_TYPE_NORMAL, trunk_compact_bundle, next_req, FALSE);
+      platform_assert_status_ok(rc);
+   }
 
    trunk_node_unlock(spl, right_node);
    trunk_node_unclaim(spl, right_node);
@@ -5819,6 +5811,7 @@ trunk_split_leaf(trunk_handle *spl,
                        slice_create(trunk_key_size(spl), req->end_key)),
             req->height,
             req->bundle_no);
+         platform_assert(trunk_key_compare(spl, req->start_key, req->end_key) < 0);
          rc = task_enqueue(
             spl->ts, TASK_TYPE_NORMAL, trunk_compact_bundle, req, FALSE);
          platform_assert(SUCCESS(rc));
@@ -5858,6 +5851,7 @@ trunk_split_leaf(trunk_handle *spl,
                  slice_create(trunk_key_size(spl), req->end_key)),
       req->height,
       req->bundle_no);
+   platform_assert(trunk_key_compare(spl, req->start_key, req->end_key) < 0);
    rc =
       task_enqueue(spl->ts, TASK_TYPE_NORMAL, trunk_compact_bundle, req, FALSE);
    platform_assert(SUCCESS(rc));
@@ -5914,7 +5908,7 @@ trunk_split_root(trunk_handle *spl, page_handle *root)
 
    trunk_add_pivot_new_root(spl, root, child);
 
-   trunk_split_index(spl, root, child, 0);
+   trunk_split_index(spl, root, child, 0, NULL);
 
    trunk_node_unlock(spl, child);
    trunk_node_unclaim(spl, child);
@@ -5986,7 +5980,7 @@ trunk_range_iterator_init(trunk_handle         *spl,
    ZERO_ARRAY(range_itor->compacted);
 
    // grab the lookup lock
-   page_handle *mt_lookup_lock_page = memtable_get_lookup_lock(spl->mt_ctxt);
+   memtable_readlock_lookup_lock(spl->mt_ctxt);
 
    // memtables
    ZERO_ARRAY(range_itor->branch);
@@ -6023,7 +6017,7 @@ trunk_range_iterator_init(trunk_handle         *spl,
    }
 
    page_handle *node = trunk_node_get(spl, spl->root_addr);
-   memtable_unget_lookup_lock(spl->mt_ctxt, mt_lookup_lock_page);
+   memtable_unreadlock_lookup_lock(spl->mt_ctxt);
 
    // index btrees
    uint16 height = trunk_height(spl, node);
@@ -6315,6 +6309,7 @@ trunk_compact_leaf(trunk_handle *spl, page_handle *leaf)
                  slice_create(trunk_key_size(spl), req->end_key)),
       req->height,
       req->bundle_no);
+   platform_assert(trunk_key_compare(spl, req->start_key, req->end_key) < 0);
    rc =
       task_enqueue(spl->ts, TASK_TYPE_NORMAL, trunk_compact_bundle, req, FALSE);
    platform_assert(SUCCESS(rc));
@@ -6650,7 +6645,7 @@ trunk_lookup(trunk_handle *spl, char *key, merge_accumulator *result)
    merge_accumulator_set_to_null(result);
 
    bool         found_in_memtable   = FALSE;
-   page_handle *mt_lookup_lock_page = memtable_get_lookup_lock(spl->mt_ctxt);
+   memtable_readlock_lookup_lock(spl->mt_ctxt);
    uint64       mt_gen_start        = memtable_generation(spl->mt_ctxt);
    uint64       mt_gen_end          = memtable_generation_retired(spl->mt_ctxt);
    for (uint64 mt_gen = mt_gen_start; mt_gen != mt_gen_end; mt_gen--) {
@@ -6667,7 +6662,7 @@ trunk_lookup(trunk_handle *spl, char *key, merge_accumulator *result)
    page_handle *node = trunk_node_get(spl, spl->root_addr);
 
    // release memtable lookup lock
-   memtable_unget_lookup_lock(spl->mt_ctxt, mt_lookup_lock_page);
+   memtable_unreadlock_lookup_lock(spl->mt_ctxt);
 
    // look in index nodes
    uint16 height = trunk_height(spl, node);
@@ -6702,7 +6697,7 @@ found_final_answer_early:
 
    if (found_in_memtable) {
       // release memtable lookup lock
-      memtable_unget_lookup_lock(spl->mt_ctxt, mt_lookup_lock_page);
+      memtable_unreadlock_lookup_lock(spl->mt_ctxt);
    } else {
       trunk_node_unget(spl, &node);
    }
@@ -6866,7 +6861,7 @@ trunk_lookup_async(trunk_handle      *spl,    // IN
          }
          case async_state_lookup_memtable:
          {
-            ctxt->mt_lock_page  = memtable_get_lookup_lock(spl->mt_ctxt);
+            memtable_readlock_lookup_lock(spl->mt_ctxt);
             uint64 mt_gen_start = memtable_generation(spl->mt_ctxt);
             uint64 mt_gen_end   = memtable_generation_retired(spl->mt_ctxt);
             for (uint64 mt_gen = mt_gen_start; mt_gen != mt_gen_end; mt_gen--) {
@@ -6876,6 +6871,7 @@ trunk_lookup_async(trunk_handle      *spl,    // IN
                if (merge_accumulator_is_definitive(result)) {
                   trunk_async_set_state(ctxt,
                                         async_state_found_final_answer_early);
+                  memtable_unreadlock_lookup_lock(spl->mt_ctxt);
                   break;
                }
             }
@@ -6913,8 +6909,7 @@ trunk_lookup_async(trunk_handle      *spl,    // IN
                   trunk_async_set_state(ctxt, async_state_trunk_node_lookup);
                   platform_assert(node == NULL);
                   ctxt->trunk_node = node = ctxt->cache_ctxt.page;
-                  memtable_unget_lookup_lock(spl->mt_ctxt, ctxt->mt_lock_page);
-                  ctxt->mt_lock_page = NULL;
+                  memtable_unreadlock_lookup_lock(spl->mt_ctxt);
                   break;
                default:
                   platform_assert(0);
@@ -7112,6 +7107,8 @@ trunk_lookup_async(trunk_handle      *spl,    // IN
                   if (merge_accumulator_is_definitive(result)) {
                      trunk_async_set_state(
                         ctxt, async_state_found_final_answer_early);
+                     trunk_node_unget(spl, &ctxt->trunk_node);
+                     ctxt->trunk_node = NULL;
                      break;
                   } else if (spl->cfg.use_stats) {
                      const uint16 height = trunk_height(spl, node);
@@ -7180,6 +7177,8 @@ trunk_lookup_async(trunk_handle      *spl,    // IN
                      spl->cfg.data_cfg, trunk_key_slice(spl, key), result);
                }
                trunk_async_set_state(ctxt, async_state_end);
+               trunk_node_unget(spl, &ctxt->trunk_node);
+               ctxt->trunk_node = NULL;
                break;
             } else {
                trunk_async_set_state(
@@ -7243,14 +7242,6 @@ trunk_lookup_async(trunk_handle      *spl,    // IN
          }
          case async_state_end:
          {
-            if (ctxt->mt_lock_page != NULL) {
-               memtable_unget_lookup_lock(spl->mt_ctxt, ctxt->mt_lock_page);
-               ctxt->mt_lock_page = NULL;
-               debug_assert(node == NULL);
-            } else {
-               trunk_node_unget(spl, &node);
-            }
-            ctxt->trunk_node = NULL;
             if (spl->cfg.use_stats) {
                if (!merge_accumulator_is_null(result)) {
                   spl->stats[tid].lookups_found++;
@@ -7348,9 +7339,11 @@ trunk_create(trunk_config     *cfg,
    // get a free node for the root
    //    we don't use the mini allocator for this, since the root doesn't
    //    maintain constant height
+   uint64 root_addr;
    platform_status rc =
-      allocator_alloc(spl->al, &spl->root_addr, PAGE_TYPE_TRUNK);
+      allocator_alloc(spl->al, &root_addr, PAGE_TYPE_TRUNK);
    platform_assert_status_ok(rc);
+   spl->root_addr = root_addr;
    page_handle *root = cache_alloc(spl->cc, spl->root_addr, PAGE_TYPE_TRUNK);
    trunk_hdr   *root_hdr = (trunk_hdr *)root->data;
    ZERO_CONTENTS(root_hdr);

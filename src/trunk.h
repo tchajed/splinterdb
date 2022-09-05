@@ -177,7 +177,7 @@ typedef struct trunk_compacted_memtable {
 } trunk_compacted_memtable;
 
 struct trunk_handle {
-   uint64           root_addr;
+   volatile uint64  root_addr;
    uint64           super_block_idx;
    trunk_config     cfg;
    platform_heap_id heap_id;
@@ -281,7 +281,6 @@ typedef struct trunk_async_ctxt {
    // These fields are internal
    trunk_async_state prev_state;   // state machine's previous state
    trunk_async_state state;        // state machine's current state
-   page_handle      *mt_lock_page; // Memtable lock page
    page_handle      *trunk_node;   // Current trunk node
    uint16            height;       // height of trunk_node
 

@@ -79,9 +79,8 @@ platform_status
 test_btree_insert(test_memtable_context *ctxt, slice key, message data)
 {
    uint64          generation;
-   page_handle    *lock_page = NULL;
-   platform_status rc        = memtable_maybe_rotate_and_get_insert_lock(
-      ctxt->mt_ctxt, &generation, &lock_page);
+   platform_status rc = memtable_maybe_rotate_and_readlock_insert_lock(
+      ctxt->mt_ctxt, &generation);
    if (!SUCCESS(rc)) {
       return rc;
    }
@@ -101,7 +100,7 @@ test_btree_insert(test_memtable_context *ctxt, slice key, message data)
                         &dummy_leaf_generation);
 
 out:
-   memtable_unget_insert_lock(ctxt->mt_ctxt, lock_page);
+   memtable_unreadlock_insert_lock(ctxt->mt_ctxt);
    return rc;
 }
 
