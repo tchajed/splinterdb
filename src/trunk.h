@@ -177,11 +177,11 @@ typedef struct trunk_compacted_memtable {
 } trunk_compacted_memtable;
 
 struct trunk_handle {
-   volatile uint64  root_addr;
-   uint64           super_block_idx;
-   trunk_config     cfg;
-   platform_heap_id heap_id;
-   platform_mutex   trunk_modification_lock;
+   volatile uint64       root_addr;
+   uint64                super_block_idx;
+   trunk_config          cfg;
+   platform_heap_id      heap_id;
+   platform_batch_rwlock trunk_root_lock;
 
    // space reclamation
    uint64 est_tuples_in_compaction;

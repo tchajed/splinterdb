@@ -90,6 +90,11 @@ static const int64 latency_histo_buckets[LATENCYHISTO_SIZE] = {
 #define TRUNK_SINGLE_LEAF_THRESHOLD_PCT (75)
 
 /*
+ * Index of the trunk_root_lock batch rwlock used.
+ */
+#define TRUNK_ROOT_LOCK_IDX 0
+
+/*
  * Trunk logging functions.
  *
  * If verbose_logging_enabled is enabled in trunk_config, these functions print
@@ -1031,21 +1036,51 @@ trunk_copy_node_and_add_to_parent(trunk_handle     *spl,
 
 /*
  *-----------------------------------------------------------------------------
- * Trunk Modification Lock
+ * Trunk Root Lock
  *
- * Lock must be acquired before making any modification to any trunk node.
+ * Read/write lock that must be read/write locked before accessing/modifying
+ * spl->root_addr.
  *-----------------------------------------------------------------------------
  */
 void
-trunk_modification_lock(trunk_handle *spl)
+trunk_root_readlock(trunk_handle *spl)
 {
-   platform_mutex_lock(&spl->trunk_modification_lock);
+   platform_batch_rwlock_readlock(&spl->trunk_root_lock, TRUNK_ROOT_LOCK_IDX);
 }
 
 void
-trunk_modification_unlock(trunk_handle *spl)
+trunk_root_unreadlock(trunk_handle *spl)
 {
-   platform_mutex_unlock(&spl->trunk_modification_lock);
+   platform_batch_rwlock_unreadlock(&spl->trunk_root_lock, TRUNK_ROOT_LOCK_IDX);
+}
+
+void
+trunk_root_writelock(trunk_handle *spl)
+{
+   platform_batch_rwlock_writelock(&spl->trunk_root_lock, TRUNK_ROOT_LOCK_IDX);
+}
+
+void
+trunk_root_unwritelock(trunk_handle *spl)
+{
+   platform_batch_rwlock_unwritelock(&spl->trunk_root_lock, TRUNK_ROOT_LOCK_IDX);
+}
+
+/*
+ *-----------------------------------------------------------------------------
+ * Safely acquire the root node.
+ *
+ * Avoids race conditions where the root addr changes in between acquiring the
+ * address and acquiring a read lock on the root itself.
+ *-----------------------------------------------------------------------------
+ */
+page_handle *
+trunk_root_get(trunk_handle *spl)
+{
+   trunk_root_readlock(spl);
+   page_handle *root = trunk_node_get(spl, spl->root_addr);
+   trunk_root_unreadlock(spl);
+   return root;
 }
 
 /*
@@ -1059,21 +1094,17 @@ trunk_modification_unlock(trunk_handle *spl)
  */
 
 platform_status
-trunk_node_get_by_key_and_height(trunk_handle *spl,      // IN
-                                 const char   *key,      // IN
-                                 uint16        height,   // IN
-                                 page_handle **out_node) // OUT
+trunk_node_get_by_key_and_height_from_root(trunk_handle *spl,      // IN
+                                           const char   *key,      // IN
+                                           uint16        height,   // IN
+                                           page_handle  *root,     // IN
+                                           page_handle **out_node) // OUT
 {
-   page_handle *node        = trunk_node_get(spl, spl->root_addr);
-   while (node->disk_addr != spl->root_addr) {
-      trunk_node_unget(spl, &node);
-      node = trunk_node_get(spl, spl->root_addr);
-   }
-   uint16 root_height = trunk_height(spl, node);
-   if (height > root_height) {
+   page_handle *node = root;
+   uint16 root_height = trunk_height(spl, root);
+   if (root_height < height) {
       goto error;
    }
-
    for (uint16 h = root_height; h > height; h--) {
       debug_assert(trunk_height(spl, node) == h);
       uint16 pivot_no = trunk_find_pivot(spl, node, key, less_than_or_equal);
@@ -1096,6 +1127,35 @@ error:
    return STATUS_BAD_PARAM;
 }
 
+
+platform_status
+trunk_node_get_by_key_and_height(trunk_handle *spl,      // IN
+                                 const char   *key,      // IN
+                                 uint16        height,   // IN
+                                 page_handle **out_node) // OUT
+{
+   page_handle *root = trunk_root_get(spl);
+   uint16 root_height = trunk_height(spl, root);
+   if (height > root_height) {
+      goto error;
+   }
+
+   return trunk_node_get_by_key_and_height_from_root(spl, key, height, root, out_node);
+error:
+   trunk_node_unget(spl, &root);
+   return STATUS_BAD_PARAM;
+}
+
+/*
+ *-----------------------------------------------------------------------------
+ * Copy the path from the root to the node at given height whose key range
+ * contains key.
+ *
+ * Requires a write lock on the  trunk_root_lock to be held.
+ *
+ * Returns the address of the new root in out_root_addr.
+ *-----------------------------------------------------------------------------
+ */
 platform_status
 trunk_node_copy_path_by_key_and_height(trunk_handle *spl,      // IN
                                        const char   *key,      // IN
@@ -1996,34 +2056,6 @@ trunk_inc_num_pivot_keys(trunk_handle *spl, page_handle *node)
 
 
 /*
- * Returns the PBN of the node at height height whose key range contains key.
- *
- * Used to locate the parent of a leaf which has finished splitting in the case
- * where the parent might have changed as a result of a internal node split or
- * root split.
- */
-uint64
-trunk_find_node(trunk_handle *spl, char *key, uint64 height)
-{
-   page_handle *node        = trunk_node_get(spl, spl->root_addr);
-   uint16       tree_height = trunk_height(spl, node);
-   for (uint16 h = tree_height; h > height + 1; h--) {
-      uint32 pivot_no = trunk_find_pivot(spl, node, key, less_than_or_equal);
-      debug_assert(pivot_no < trunk_num_children(spl, node));
-      trunk_pivot_data *pdata = trunk_get_pivot_data(spl, node, pivot_no);
-      page_handle      *child = trunk_node_get(spl, pdata->addr);
-      trunk_node_unget(spl, &node);
-      node = child;
-   }
-   uint32 pivot_no = trunk_find_pivot(spl, node, key, less_than_or_equal);
-   debug_assert(pivot_no < trunk_num_children(spl, node));
-   trunk_pivot_data *pdata    = trunk_get_pivot_data(spl, node, pivot_no);
-   uint64            ret_addr = pdata->addr;
-   trunk_node_unget(spl, &node);
-   return ret_addr;
-}
-
-/*
  *-----------------------------------------------------------------------------
  * Bundle functions
  *-----------------------------------------------------------------------------
@@ -2716,6 +2748,7 @@ trunk_garbage_collect_bundle(trunk_handle             *spl,
    platform_status rc = STATUS_OK;
    uint16 height = req->height;
    const char *key = req->start_key;
+   // Note: don't need to acquire the trunk_root_lock here.
    page_handle *node        = trunk_node_get(spl, old_root_addr);
    uint16       root_height = trunk_height(spl, node);
    trunk_node_claim(spl, &node);
@@ -3515,9 +3548,9 @@ trunk_memtable_incorporate_and_flush(trunk_handle  *spl,
    /*
     * 1. Lock Trunk Modification Lock and copy root.
     */
+   trunk_root_writelock(spl);
    page_handle *root = trunk_node_get(spl, spl->root_addr);
    platform_assert(trunk_has_vacancy(spl, root, 1));
-   trunk_modification_lock(spl);
    page_handle *new_root = trunk_node_copy(spl, root);
    trunk_node_unget(spl, &root);
 
@@ -3585,6 +3618,7 @@ trunk_memtable_incorporate_and_flush(trunk_handle  *spl,
    memtable_transition(
       mt, MEMTABLE_STATE_INCORPORATING, MEMTABLE_STATE_INCORPORATED);
    memtable_increment_to_generation_retired(spl->mt_ctxt, generation);
+   // Note: have write lock on the trunk_root_lock
    spl->root_addr = new_root->disk_addr;
    memtable_unwritelock_lookup_lock(spl->mt_ctxt);
 
@@ -3592,7 +3626,7 @@ trunk_memtable_incorporate_and_flush(trunk_handle  *spl,
     * 6. Unlock the TML and new root.
     */
    trunk_node_unlock(spl, new_root);
-   trunk_modification_unlock(spl);
+   trunk_root_unwritelock(spl);
    trunk_node_unclaim(spl, new_root);
    trunk_node_unget(spl, &new_root);
 
@@ -3827,8 +3861,9 @@ trunk_filter_build_node_get_and_claim(trunk_handle         *spl,
                                       trunk_filter_scratch *req,
                                       page_handle         **node)
 {
+   page_handle *root = trunk_node_get(spl, spl->root_addr);
    platform_status rc =
-      trunk_node_get_by_key_and_height(spl, req->start_key, req->height, node);
+      trunk_node_get_by_key_and_height_from_root(spl, req->start_key, req->height, root, node);
    if (!SUCCESS(rc)) {
       return rc;
    }
@@ -4153,7 +4188,7 @@ trunk_bundle_build_filters(void *arg, void *scratch)
 
       bool should_continue_replacing_filters = TRUE;
       while (should_continue_replacing_filters) {
-         trunk_modification_lock(spl);
+         trunk_root_writelock(spl);
          rc =
             trunk_filter_build_node_get_and_claim(spl, &filter_scratch, &node);
          platform_assert_status_ok(rc);
@@ -4174,7 +4209,7 @@ trunk_bundle_build_filters(void *arg, void *scratch)
             trunk_clear_bundle(spl, node, compact_req->bundle_no);
          }
          trunk_node_unlock(spl, node);
-         trunk_modification_unlock(spl);
+         trunk_root_unwritelock(spl);
          trunk_node_unclaim(spl, node);
          debug_assert(trunk_verify_node(spl, node));
 
@@ -5062,7 +5097,7 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
    uint64 num_replacements = 0;
    bool   should_continue  = TRUE;
    while (should_continue) {
-      trunk_modification_lock(spl);
+      trunk_root_writelock(spl);
       uint64 new_root_addr = 0;
       uint64 old_root_addr = spl->root_addr;
       rc = trunk_compact_bundle_node_copy_path(spl, req, &node, &new_root_addr);
@@ -5100,7 +5135,7 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
                platform_timestamp_elapsed(compaction_start);
          }
          trunk_node_unlock(spl, node);
-         trunk_modification_unlock(spl);
+         trunk_root_unwritelock(spl);
          trunk_node_unclaim(spl, node);
          trunk_node_unget(spl, &node);
 
@@ -5154,7 +5189,7 @@ trunk_compact_bundle(void *arg, void *scratch_buf)
          trunk_key_copy(spl, req->start_key, trunk_max_key(spl, node));
       }
       spl->root_addr = new_root_addr;
-      trunk_modification_unlock(spl);
+      trunk_root_unwritelock(spl);
 
       // garbage collect the old path and bundle
       rc = trunk_garbage_collect_bundle(spl, old_root_addr, req);
@@ -5226,7 +5261,7 @@ trunk_flush_node(trunk_handle *spl, uint64 addr, void *arg)
 {
    page_handle *node = trunk_node_get(spl, addr);
    trunk_node_claim(spl, &node);
-   trunk_modification_lock(spl);
+   trunk_root_writelock(spl);
    trunk_node_lock(spl, node);
 
    if (trunk_height(spl, node) != 0) {
@@ -5241,7 +5276,7 @@ trunk_flush_node(trunk_handle *spl, uint64 addr, void *arg)
    }
 
    trunk_node_unlock(spl, node);
-   trunk_modification_unlock(spl);
+   trunk_root_unwritelock(spl);
    trunk_node_unclaim(spl, node);
    trunk_node_unget(spl, &node);
 
@@ -5249,7 +5284,7 @@ trunk_flush_node(trunk_handle *spl, uint64 addr, void *arg)
 
    node = trunk_node_get(spl, addr);
    trunk_node_claim(spl, &node);
-   trunk_modification_lock(spl);
+   trunk_root_writelock(spl);
    trunk_node_lock(spl, node);
 
    if (trunk_height(spl, node) == 1) {
@@ -5264,7 +5299,7 @@ trunk_flush_node(trunk_handle *spl, uint64 addr, void *arg)
    }
 
    trunk_node_unlock(spl, node);
-   trunk_modification_unlock(spl);
+   trunk_root_unwritelock(spl);
    trunk_node_unclaim(spl, node);
    trunk_node_unget(spl, &node);
 
@@ -6016,7 +6051,7 @@ trunk_range_iterator_init(trunk_handle         *spl,
       range_itor->num_branches++;
    }
 
-   page_handle *node = trunk_node_get(spl, spl->root_addr);
+   page_handle *node = trunk_root_get(spl);
    memtable_unreadlock_lookup_lock(spl->mt_ctxt);
 
    // index btrees
@@ -6371,7 +6406,7 @@ trunk_reclaim_space(trunk_handle *spl)
       }
       pdata->srq_idx = -1;
 
-      trunk_modification_lock(spl);
+      trunk_root_unwritelock(spl);
       trunk_node_lock(spl, node);
       if (trunk_is_leaf(spl, node)) {
          trunk_compact_leaf(spl, node);
@@ -6390,14 +6425,14 @@ trunk_reclaim_space(trunk_handle *spl)
          }
          if (!SUCCESS(rc)) {
             trunk_node_unlock(spl, node);
-            trunk_modification_unlock(spl);
+            trunk_root_unwritelock(spl);
             trunk_node_unclaim(spl, node);
             trunk_node_unget(spl, &node);
             continue;
          }
       }
       trunk_node_unlock(spl, node);
-      trunk_modification_unlock(spl);
+      trunk_root_unwritelock(spl);
       trunk_node_unclaim(spl, node);
       trunk_node_unget(spl, &node);
       return STATUS_OK;
@@ -6659,7 +6694,7 @@ trunk_lookup(trunk_handle *spl, char *key, merge_accumulator *result)
    }
 
    // hold root read lock to prevent memtable flush
-   page_handle *node = trunk_node_get(spl, spl->root_addr);
+   page_handle *node = trunk_root_get(spl);
 
    // release memtable lookup lock
    memtable_unreadlock_lookup_lock(spl->mt_ctxt);
@@ -7332,7 +7367,7 @@ trunk_create(trunk_config     *cfg,
    spl->heap_id = hid;
    spl->ts      = ts;
 
-   platform_mutex_init(&spl->trunk_modification_lock, NULL, hid);
+   platform_batch_rwlock_init(&spl->trunk_root_lock);
 
    srq_init(&spl->srq, platform_get_module_id(), hid);
 
@@ -7445,7 +7480,7 @@ trunk_mount(trunk_config     *cfg,
 
    srq_init(&spl->srq, platform_get_module_id(), hid);
 
-   platform_mutex_init(&spl->trunk_modification_lock, NULL, hid);
+   platform_batch_rwlock_init(&spl->trunk_root_lock);
 
    // find the dismounted super block
    spl->root_addr                      = 0;
@@ -7595,7 +7630,6 @@ trunk_destroy(trunk_handle *spl)
    trunk_prepare_for_shutdown(spl);
    trunk_for_each_node(spl, trunk_node_destroy, NULL);
    mini_unkeyed_dec_ref(spl->cc, spl->mini.meta_head, PAGE_TYPE_TRUNK, FALSE);
-   platform_mutex_destroy(&spl->trunk_modification_lock);
    // clear out this splinter table from the meta page.
    allocator_remove_super_addr(spl->al, spl->id);
 
@@ -7623,7 +7657,6 @@ trunk_dismount(trunk_handle *spl)
    srq_deinit(&spl->srq);
    trunk_prepare_for_shutdown(spl);
    trunk_set_super_block(spl, FALSE, TRUE, FALSE);
-   platform_mutex_destroy(&spl->trunk_modification_lock);
    if (spl->cfg.use_stats) {
       for (uint64 i = 0; i < MAX_THREADS; i++) {
          platform_histo_destroy(spl->heap_id,
