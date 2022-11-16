@@ -6910,6 +6910,9 @@ trunk_lookup_async(trunk_handle      *spl,    // IN
                   break;
                }
             }
+            if (ctxt->state == async_state_found_final_answer_early) {
+               break;
+            }
             // fallthrough
          }
          case async_state_get_root_reentrant:

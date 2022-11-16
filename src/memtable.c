@@ -268,11 +268,6 @@ memtable_context_create(platform_heap_id hid,
    ctxt->cc = cc;
    memmove(&ctxt->cfg, cfg, sizeof(ctxt->cfg));
 
-   uint64          base_addr;
-   allocator      *al = cache_allocator(cc);
-   platform_status rc = allocator_alloc(al, &base_addr, PAGE_TYPE_LOCK_NO_DATA);
-   platform_assert_status_ok(rc);
-
    platform_mutex_init(&ctxt->incorporation_mutex, platform_get_module_id(),
          hid);
    ctxt->rwlock = TYPED_MALLOC(hid, ctxt->rwlock);
