@@ -66,8 +66,19 @@ CTEST_DATA(limitations)
 // clang-format off
 CTEST_SETUP(limitations)
 {
-   Platform_default_log_handle = fopen("/tmp/unit_test.stdout", "a+");
-   Platform_error_log_handle = fopen("/tmp/unit_test.stderr", "a+");
+   // This test exercises error cases, so even when everthing succeeds
+   // it generates lots of "error" messages.
+   // By default, that would go to stderr, which would pollute test output.
+   // Here we ensure those _expected error messages_ are only printed
+   // when the caller opts in, by setting the VERBOSE env var.
+   if (Ctest_verbosity) {
+      platform_set_log_streams(stdout, stderr);
+      CTEST_LOG_INFO("\nVerbose mode on, successful tests may print messages that appear to be errors\n");
+   } else {
+      FILE *dev_null = fopen("/dev/null", "w");
+      ASSERT_NOT_NULL(dev_null);
+      platform_set_log_streams(dev_null, dev_null);
+   }
 
    uint64 heap_capacity = (1 * GiB);
 
