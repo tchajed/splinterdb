@@ -8,7 +8,7 @@ use cbindgen::Language;
 fn gen_import() {
     println!("cargo:rerun-if-changed=wrapper.h");
 
-    let platform_dir = env::var("PLATFORM_DIR").unwrap_or("linux".to_string());
+    let platform_dir = env::var("PLATFORM_DIR").unwrap_or("platform_linux".to_string());
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
